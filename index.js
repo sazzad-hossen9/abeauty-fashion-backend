@@ -16,7 +16,24 @@ const allowedOrigins = (
   .split(",")
   .map((o) => o.trim())
   .filter(Boolean);
-app.use(cors({ origin: allowedOrigins, credentials: true }));
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (
+        allowedOrigins.includes(origin) ||
+        origin.endsWith(".vercel.app") ||
+        origin.includes("localhost") ||
+        origin.includes("127.0.0.1")
+      ) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const ALLOWED_CATEGORIES = new Set([
@@ -73,7 +90,84 @@ function serializeProduct(doc) {
 }
 
 // MongoDB Connection
-const client = new MongoClient(process.env.MONGODB_URI);
+let client = null;
+function getClient() {
+  if (!client) {
+    if (!process.env.MONGODB_URI) {
+      throw new Error("MONGODB_URI environment variable is not defined");
+    }
+    client = new MongoClient(process.env.MONGODB_URI);
+  }
+  return client;
+}
+
+let db = null;
+let productsCollection = null;
+let ordersCollection = null;
+let wishlistCollection = null;
+let usersCollection = null;
+let articlesCollection = null;
+let reviewsCollection = null;
+let couponsCollection = null;
+let countersCollection = null;
+let contactsCollection = null;
+
+let connectPromise = null;
+async function connectDB() {
+  if (db) return db;
+  if (!connectPromise) {
+    connectPromise = (async () => {
+      const cli = getClient();
+      await cli.connect();
+      console.log("Successfully connected to MongoDB!");
+      const database = cli.db("abeauty-fashion");
+      db = database;
+      productsCollection = db.collection("products");
+      ordersCollection = db.collection("orders");
+      wishlistCollection = db.collection("wishlist");
+      usersCollection = db.collection("users");
+      articlesCollection = db.collection("articles");
+      reviewsCollection = db.collection("reviews");
+      couponsCollection = db.collection("coupons");
+      countersCollection = db.collection("counters");
+      contactsCollection = db.collection("contacts");
+
+      try {
+        await Promise.all([
+          productsCollection.createIndex({ slug: 1 }, { unique: true, sparse: true }),
+          productsCollection.createIndex({ isActive: 1, category: 1 }),
+          productsCollection.createIndex({ badge: 1 }),
+        ]);
+      } catch (err) {
+        console.warn("Index warning:", err.message);
+      }
+      return db;
+    })();
+  }
+  return connectPromise;
+}
+
+// Middleware to guarantee MongoDB is connected before handling requests
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    console.error("DB connection error in middleware:", err);
+    res.status(500).json({ error: "Database connection failed" });
+  }
+});
+
+const getNextSequence = async (name, startAt = 1000) => {
+  await connectDB();
+  const counter = await countersCollection.findOneAndUpdate(
+    { _id: name },
+    { $inc: { seq: 1 } },
+    { upsert: true, returnDocument: "after" }
+  );
+  const seq = counter?.seq ?? counter?.value?.seq ?? 1;
+  return startAt + seq;
+};
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
   const hash = crypto.scryptSync(String(password), salt, 64).toString("hex");
@@ -92,39 +186,6 @@ function sanitizeUser(userDoc) {
   const { passwordHash, password, ...safe } = userDoc;
   return { ...safe, id: userDoc._id.toString() };
 }
-
-async function run() {
-  try {
-    await client.connect();
-    console.log("Successfully connected to MongoDB!");
-
-    const db = client.db("abeauty-fashion");
-    const productsCollection = db.collection("products");
-    const ordersCollection = db.collection("orders");
-    const wishlistCollection = db.collection("wishlist");
-    const usersCollection = db.collection("users");
-    const articlesCollection = db.collection("articles");
-    const reviewsCollection = db.collection("reviews");
-    const couponsCollection = db.collection("coupons");
-    const countersCollection = db.collection("counters");
-    const contactsCollection = db.collection("contacts");
-
-    const getNextSequence = async (name, startAt = 1000) => {
-      const counter = await countersCollection.findOneAndUpdate(
-        { _id: name },
-        { $inc: { seq: 1 } },
-        { upsert: true, returnDocument: "after" }
-      );
-      const seq = counter?.seq ?? counter?.value?.seq ?? 1;
-      return startAt + seq;
-    };
-
-    // Create product indexes at startup
-    await Promise.all([
-      productsCollection.createIndex({ slug: 1 }, { unique: true, sparse: true }),
-      productsCollection.createIndex({ isActive: 1, category: 1 }),
-      productsCollection.createIndex({ badge: 1 }),
-    ]).catch((err) => console.warn("Product index creation warning:", err.message));
 
     // ==================== PRODUCTS APIS ====================
     const listProductsHandler = async (req, res) => {
@@ -564,17 +625,17 @@ async function run() {
         res.status(500).send({ error: "Failed to submit contact inquiry" });
       }
     });
-  } catch (error) {
-    console.error("Database connection error:", error);
-  }
-}
-
-run().catch(console.dir);
 
 app.get("/", (req, res) => {
   res.send({ message: "A-Beauty & Fashion Server is running successfully!" });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+connectDB().catch((err) => console.error("Initial DB connection failed:", err));
+
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+  });
+}
+
+export default app;
